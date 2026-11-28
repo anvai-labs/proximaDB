@@ -728,11 +728,10 @@ async fn parity_comparator_detects_mutated_legs() {
     assert!(legs_agree(&real, &same), "an unmutated leg must agree");
 }
 
-/// LOW-6 (round-1 review): the fail-closed gate is a 401 at the HTTP surface
-/// (not a 500): the multimodal router, mounted bare (no identity extension,
-/// no scope), answers 401 for a plain read.
+/// The HTTP router requires a resolved identity even when a task-local
+/// tenant scope is active. The port's internal fallback is tested separately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scope_less_port_call_is_unauthorized_not_internal() {
+async fn unified_http_requires_identity_even_in_tenant_scope() {
     use proximadb_api::rest::{UnifiedQueryRestState, create_multimodal_router};
 
     let (state, _services, _temp) = build_port_stack().await;
@@ -741,8 +740,8 @@ async fn scope_less_port_call_is_unauthorized_not_internal() {
         unified_query_port: port,
     });
 
-    let response = router
-        .oneshot(
+    let dispatch = || {
+        router.clone().oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/execute")
@@ -752,14 +751,20 @@ async fn scope_less_port_call_is_unauthorized_not_internal() {
                 ))
                 .expect("request builds"),
         )
-        .await
-        .expect("oneshot");
-
-    assert_eq!(
-        response.status(),
-        StatusCode::UNAUTHORIZED,
-        "no identity and no scope must be a 401, not a 500"
-    );
+    };
+    for response in [
+        dispatch().await,
+        proximadb::query::request_scope::with_request_tenant("default", async { dispatch().await })
+            .await,
+    ] {
+        let (status, body) = read_response(response.expect("oneshot")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            body.get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
+    }
 }
 
 /// TD-SPINE-6 fail-closed acceptance: with neither an explicit identity

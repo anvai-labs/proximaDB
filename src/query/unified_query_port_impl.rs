@@ -705,11 +705,19 @@ async fn run_sql_via_one_planner_within_deadline(
         // strategies. L2 (round 2): the fail-closed gate is typed here too —
         // `FederatedQueryContext` denies a scope-less request with an
         // untyped (500-class) error.
-        effective_identity_or_fail(&identity)?;
-        let result = adapter
-            .federated_query(sql)
+        let effective = effective_identity_or_fail(&identity)?;
+        let result =
+            crate::query::request_scope::with_port_identity(effective.as_borrowed(), |_| {
+                adapter.federated_query(sql)
+            })
             .await
-            .context("federated_query failed")?;
+            .map_err(|error| {
+                if error.downcast_ref::<InvalidQueryInput>().is_some() {
+                    error
+                } else {
+                    error.context("federated_query failed")
+                }
+            })?;
         return UnifiedQueryPortImpl::result_to_json(result, limit);
     }
     // RAW user text: AST read classification (HIGH-1, round 2 — never a

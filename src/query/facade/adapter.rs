@@ -767,9 +767,10 @@ impl QueryFacadeAdapter {
     ) -> anyhow::Result<proximadb_runtime::SqlExecutionResult> {
         // The statement runs in the caller's scope: its tenant when the
         // identity carries one (collections resolve within it), else the
-        // scope already in force (see `request_scope::with_identity_scope`).
-        let scope_tenant = identity.tenant_id;
-        crate::query::request_scope::with_identity_scope(scope_tenant, async move {
+        // scope already in force. The full identity also reaches federated
+        // reads if the authority falls through to the facade.
+        crate::query::request_scope::with_port_identity(identity, |effective| async move {
+            let identity = effective.as_borrowed();
             let tenant_id = identity.tenant_id;
 
             // EXPLAIN [ANALYZE] <DML> routing — parity with the ROOT handler's
@@ -923,9 +924,9 @@ impl QueryFacadeAdapter {
                 "pgvector `ORDER BY <column> <-> <vector> LIMIT k` KNN SQL is not served on this surface (no vector search service on the SQL authority path); use pgwire or the vector search API".to_string(),
             )));
         }
-        let scope_tenant = identity.tenant_id;
-        crate::query::request_scope::with_identity_scope(scope_tenant, async {
-            self.execute_read_path(&query, identity, result_cache).await
+        crate::query::request_scope::with_port_identity(identity, |effective| async move {
+            self.execute_read_path(&query, effective.as_borrowed(), result_cache)
+                .await
         })
         .await
     }

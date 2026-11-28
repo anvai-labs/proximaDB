@@ -42,7 +42,7 @@ use proximadb_abac::{
 };
 use proximadb_catalog::fc_metamodel::{AttrValue, Effect, PolicyBinding, Scope};
 use proximadb_data_model::ProximaValue;
-use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord, ProximaTreeNode};
+use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTreeNode};
 use proximadb_runtime::{PortIdentity, RichRecordGetRequest, RichSearchRequest};
 use serde_json::json;
 use std::sync::Arc;
@@ -350,6 +350,162 @@ async fn v1_none_subject_is_passthrough() {
         ids.iter().any(|id| id == OID_ENG) && ids.iter().any(|id| id == OID_HR),
         "a None subject must see both records on the v1 path (passthrough); got {ids:?}"
     );
+}
+
+/// Exercise lowered REST and raw federated SQL through the real query strategy,
+/// scoped collection lookup, vector policy evaluator, and an enabled cache.
+#[tokio::test]
+async fn federated_reads_keep_the_policy_principal_and_skip_shared_results() {
+    use axum::{Extension, body::Body, http::Request, http::StatusCode};
+    use proximadb::network::rest::canonical::rank::{MockRangeCandidateProvider, RankServices};
+    use proximadb::query::{
+        FederatedQueryContext, QueryFacadeAdapter, SqlStrategy, UnifiedQueryFacade,
+        UnifiedQueryPortImpl,
+        cache::{FederatedQueryResultCache, query_result_cache::QueryResultCacheConfig},
+    };
+    use proximadb::storage::MultiModelStorageFacade;
+    use proximadb_api::rest::{UnifiedQueryRestState, create_multimodal_router};
+    use proximadb_tenant::{AuthClass, DEFAULT_TENANT, ResolvedRequestIdentity};
+    use tower::ServiceExt;
+
+    let (vectors, collections) = fixture().await;
+    let cache = Arc::new(FederatedQueryResultCache::new(QueryResultCacheConfig {
+        enable_cleanup: false,
+        ..Default::default()
+    }));
+    let federated =
+        FederatedQueryContext::with_cache(Arc::new(MultiModelStorageFacade::new()), cache.clone())
+            .with_collection_port(collections)
+            .with_vector_operations(vectors)
+            .with_rank_services(Arc::new(RankServices::new(Arc::new(
+                MockRangeCandidateProvider::default(),
+            ))));
+    let facade = Arc::new(UnifiedQueryFacade::with_strategies(vec![Arc::new(
+        SqlStrategy::new(Arc::new(federated)),
+    )]));
+    let router = create_multimodal_router().with_state(UnifiedQueryRestState {
+        unified_query_port: Arc::new(UnifiedQueryPortImpl::new(Arc::new(
+            QueryFacadeAdapter::without_validation(facade),
+        ))),
+    });
+    let request = |path: &'static str,
+                   body: serde_json::Value,
+                   subject: Option<&'static str>,
+                   stable: Option<u64>| {
+        let router = router.clone();
+        async move {
+            let identity = ResolvedRequestIdentity {
+                tenant: DEFAULT_TENANT.to_owned(),
+                subject: subject.map(str::to_owned),
+                auth_class: if subject.is_some() {
+                    AuthClass::Authenticated
+                } else {
+                    AuthClass::Anonymous
+                },
+                tenant_stable_id: stable,
+            };
+            let response = router
+                .layer(Extension(identity))
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body = serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON");
+            (status, body)
+        }
+    };
+
+    let lowered = json!({ "components": [{ "component_type": "vector", "config": {
+        "collection": COLLECTION, "query_vector": [1.0, 0.0, 0.0, 0.0], "top_k": 10,
+    }}] });
+    let raw = json!({ "query": format!(
+        "SELECT * FROM VECTOR_SEARCH('{}', '[1.0, 0.0, 0.0, 0.0]', 10)", COLLECTION,
+    ) });
+    let ids = |body: &serde_json::Value| -> Vec<String> {
+        body["records"]
+            .as_array()
+            .expect("records")
+            .iter()
+            .map(|row| row["id"].as_str().expect("record ID").to_owned())
+            .collect()
+    };
+
+    let (status, broad) = request("/multi-model", lowered.clone(), None, Some(TENANT)).await;
+    assert_eq!(status, StatusCode::OK, "{broad}");
+    assert_eq!(ids(&broad).len(), 2);
+    let (status, hit) = request("/multi-model", lowered.clone(), None, Some(TENANT)).await;
+    assert_eq!(status, StatusCode::OK, "{hit}");
+    assert_eq!(ids(&hit), ids(&broad));
+    let warm_cache = cache.stats();
+    assert!(
+        warm_cache.hits > 0,
+        "the subjectless control must warm the shared cache"
+    );
+
+    let rerank = json!({ "query": format!(
+        "SELECT * FROM RERANK('{}', 'q', '[1.0, 0.0, 0.0, 0.0]', 10)", COLLECTION,
+    ) });
+    for (path, query) in [
+        ("/multi-model", lowered),
+        ("/federated", raw),
+        ("/federated", rerank),
+    ] {
+        for (subject, stable, expected) in [
+            ("alice", Some(TENANT), vec![OID_ENG.to_owned()]),
+            ("mallory", Some(TENANT), Vec::new()),
+            ("alice", None, Vec::new()),
+        ] {
+            let (status, body) = request(path, query.clone(), Some(subject), stable).await;
+            assert_eq!(status, StatusCode::OK, "{path} {subject}: {body}");
+            assert_eq!(
+                ids(&body),
+                expected,
+                "{path} {subject} (stable ID {stable:?})"
+            );
+        }
+    }
+    let after_subject_reads = cache.stats();
+    assert_eq!(after_subject_reads.hits, warm_cache.hits);
+    assert_eq!(after_subject_reads.misses, warm_cache.misses);
+    assert_eq!(after_subject_reads.inserts, warm_cache.inserts);
+
+    let unsupported = [
+        (
+            "/federated",
+            json!({ "query": "SELECT * FROM GRAPH_QUERY('MATCH (n) RETURN n')" }),
+        ),
+        (
+            "/multi-model",
+            json!({ "components": [{ "component_type": "graph", "config": {
+            "cypher": "MATCH (n) RETURN n",
+        }}] }),
+        ),
+        (
+            "/federated",
+            json!({ "query": format!(
+            "SELECT * FROM RERANK('{}', 'q', '[1.0, 0.0, 0.0, 0.0]', 10, 'profile')", COLLECTION,
+        ) }),
+        ),
+    ];
+    for (path, query) in unsupported {
+        let (status, body) = request(path, query, Some("alice"), Some(TENANT)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("policy error")
+                .contains("subject-level read policies"),
+            "{path}: {body}",
+        );
+    }
 }
 
 // ── The ONE composition rule (ADR-087 / TD-ABAC-10c) ────────────────────────

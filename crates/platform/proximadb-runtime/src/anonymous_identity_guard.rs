@@ -45,6 +45,11 @@ mod tests {
             "internal execution outside a request scope (requests carry request_scope)",
         ),
         (
+            "src/query/unified_query_port_impl.rs",
+            2,
+            "negative and tenant-scope fallback controls inside the port's unit tests",
+        ),
+        (
             "src/services/dml/mod.rs",
             1,
             "scan is scoped by the TenantContext argument; identity carries no subject",

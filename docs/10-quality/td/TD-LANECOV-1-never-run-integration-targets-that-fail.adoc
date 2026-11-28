@@ -75,7 +75,7 @@ deliberate change; **investigate** = deterministic failure, cause not yet proven
   `test_record_store_route` is one empty placeholder. Wiring them would let the
   ratchet certify coverage that checks nothing, so they stay on the baseline.
   Owner decision: implement, or delete with sign-off.
-* `abac_vector_pushdown_integration_test`, `abac_rest_record_search_integration_test`: their tests compile out without `abac-policy`; they belong in the feature-matrix lane.
+* `abac_vector_pushdown_integration_test` compiles out without `abac-policy` and still needs feature-enabled CI coverage. The authorization lane runs `abac_rest_record_search_integration_test` with that feature.
 * `cdc_rest_changefeed_e2e`: requires `cdc-kafka`.
 * 43 targets that need external services, are cfg-gated or `#[ignore]`d.
 

@@ -816,6 +816,12 @@ impl VectorOperationsService {
         }
     }
 
+    /// Whether subject reads must consult the vector authorization policy.
+    #[cfg(feature = "abac-policy")]
+    pub(crate) fn has_abac_enforcer(&self) -> bool {
+        self.abac_enforcer.is_some()
+    }
+
     /// Expose the unified storage engine as a trait object for integration points
     pub fn unified_engine(&self) -> Arc<dyn crate::storage::traits::UnifiedStorageFormat> {
         self.storage_engine.clone() as Arc<dyn crate::storage::traits::UnifiedStorageFormat>

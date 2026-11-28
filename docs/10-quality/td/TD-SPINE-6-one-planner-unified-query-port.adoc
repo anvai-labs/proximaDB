@@ -104,11 +104,16 @@ The plan's acceptance was "same rows AND the same route decision over pgwire, RE
   `/api/v2/sql`); the canonical `/sql` handler passes `PortIdentity::for_tenant(scoped_tenant)`
   (that handler is currently unrouted since the v1 surface removal — TD-V1SUNSET-1 — but remains
   the canonical module's SQL entry and is exercised in-process by the parity suite);
-  MCP passes its configured tenant; the multimodal `/api/v2/unified/*` handlers take
-  `Option<Extension<ResolvedRequestIdentity>>`. The task-local `request_scope` remains ONLY as
-  the documented fallback (bare-mounted test routers; the federated lowering's own scope
-  requirement) — prepared-statement owner keying prefers the explicit identity tenant, then the
+  MCP passes its configured tenant. The multimodal `/api/v2/unified/*` handlers require the
+  middleware-stamped `ResolvedRequestIdentity` and return JSON 401 if it is missing or has
+  an empty tenant. Task-local `request_scope` still serves internal port callers and federated
+  lowering. Prepared-statement owner keying prefers the explicit identity tenant, then the
   scope. Plain SQL with neither identity nor scope fails closed ("no request identity").
+. **Federated read policies.** Lowered and raw federated SQL retain the port identity through
+  scoped collection lookup and the canonical vector-policy check. Subject-bearing results
+  bypass the shared federated cache. With the ABAC feature and an active policy enforcer,
+  federated readers without a subject-policy contract reject the query, including the full
+  profiled reranker. Retrieval-only reranking uses the authorized vector reader.
 . **`execute_distributed_query`** deliberately does NOT route through the seam: it is an explicit
   `force_path = "distributed"` override onto the `DistributedQueryCoordinator` — a placement
   decision orthogonal to local engine selection (ADR-098 D5's owner-versus-reader placement is

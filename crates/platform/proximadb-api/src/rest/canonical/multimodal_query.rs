@@ -24,9 +24,9 @@
 use std::sync::Arc;
 
 use axum::{
-    Extension, Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
-    http::StatusCode,
+    Json, Router,
+    extract::{FromRequestParts, Path, State, rejection::JsonRejection},
+    http::{StatusCode, request::Parts},
     response::IntoResponse,
     routing::{delete, post},
 };
@@ -36,22 +36,38 @@ use proximadb_runtime::{
     InvalidQueryInput, MissingQueryIdentity, QueryDeadlineExceeded, UnifiedQueryPort,
     UnifiedQueryPortContext,
 };
+use proximadb_tenant::ResolvedRequestIdentity;
 use serde::Deserialize;
 use tracing::{error, info};
 
-/// The per-request port context: the foundation identity the tenant
-/// middleware stamps (ADR-087) travels as data on the call (ADR-098 D5 /
-/// TD-SPINE-6). `None` (a bare-mounted router, e.g. tests) leaves the
-/// identity empty — the port then falls back to the task-local request
-/// scope and fails closed when neither is present.
-fn port_context<'a>(
-    identity: &'a Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
-) -> UnifiedQueryPortContext<'a> {
-    match identity {
-        Some(Extension(resolved)) => {
-            UnifiedQueryPortContext::for_identity(proximadb_runtime::PortIdentity::from(resolved))
-        }
-        None => UnifiedQueryPortContext::for_identity(proximadb_runtime::PortIdentity::anonymous()),
+/// Require the identity stamped by the shared tenant middleware (ADR-087).
+struct QueryIdentity(ResolvedRequestIdentity);
+
+impl<S: Sync> FromRequestParts<S> for QueryIdentity {
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<ResolvedRequestIdentity>()
+            .filter(|identity| !identity.tenant.trim().is_empty())
+            .cloned()
+            .map(Self)
+            .ok_or_else(|| {
+                port_error_response(
+                    "unified query",
+                    MissingQueryIdentity(
+                        "unified query has no request identity; the caller must act as a tenant",
+                    )
+                    .into(),
+                )
+            })
+    }
+}
+
+impl QueryIdentity {
+    fn port_context(&self) -> UnifiedQueryPortContext<'_> {
+        UnifiedQueryPortContext::for_identity(proximadb_runtime::PortIdentity::from(&self.0))
     }
 }
 
@@ -219,7 +235,7 @@ fn port_error_response(op: &str, e: anyhow::Error) -> axum::response::Response {
 
 async fn execute_query(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     body: Result<Json<ExecuteQueryRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
@@ -238,20 +254,20 @@ async fn execute_query(
         params,
         req.collection,
         req.limit,
-        port_context(&identity),
+        identity.port_context(),
     );
     respond_port_result("execute_unified_query", execution).await
 }
 
 async fn execute_multi_model_query(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     match s
         .unified_query_port
-        .execute_multi_model_query(req, port_context(&identity))
+        .execute_multi_model_query(req, identity.port_context())
         .await
     {
         Ok(result) => Json(result).into_response(),
@@ -274,7 +290,7 @@ async fn execute_multi_model_query(
 
 async fn execute_federated_query(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     body: Result<Json<ExecuteFederatedRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
@@ -285,31 +301,31 @@ async fn execute_federated_query(
     let params = json_to_proxima_values(req.parameters);
     let execution =
         s.unified_query_port
-            .execute_federated_query(req.query, params, port_context(&identity));
+            .execute_federated_query(req.query, params, identity.port_context());
     respond_port_result("execute_federated_query", execution).await
 }
 
 async fn execute_distributed_query(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     let execution = s
         .unified_query_port
-        .execute_distributed_query(req, port_context(&identity));
+        .execute_distributed_query(req, identity.port_context());
     respond_port_result("execute_distributed_query", execution).await
 }
 
 async fn explain_query(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     body: Result<Json<ExplainQueryRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     match s
         .unified_query_port
-        .explain_unified_query(req.query, req.collection, port_context(&identity))
+        .explain_unified_query(req.query, req.collection, identity.port_context())
         .await
     {
         Ok(result) => Json(result).into_response(),
@@ -319,7 +335,7 @@ async fn explain_query(
 
 async fn prepare_statement(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     body: Result<Json<PrepareStatementRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
@@ -330,7 +346,7 @@ async fn prepare_statement(
             req.query,
             req.cache_results,
             req.ttl_seconds,
-            port_context(&identity),
+            identity.port_context(),
         )
         .await
     {
@@ -345,7 +361,7 @@ async fn prepare_statement(
 
 async fn execute_prepared_statement(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     Path(statement_id): Path<String>,
     body: Result<Json<ExecutePreparedRequest>, JsonRejection>,
 ) -> impl IntoResponse {
@@ -355,19 +371,19 @@ async fn execute_prepared_statement(
         statement_id,
         params,
         req.collection,
-        port_context(&identity),
+        identity.port_context(),
     );
     respond_port_result("execute_prepared", execution).await
 }
 
 async fn delete_prepared_statement(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     Path(statement_id): Path<String>,
 ) -> impl IntoResponse {
     match s
         .unified_query_port
-        .delete_prepared(statement_id, port_context(&identity))
+        .delete_prepared(statement_id, identity.port_context())
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -377,13 +393,13 @@ async fn delete_prepared_statement(
 
 async fn get_prepared_stats(
     State(s): State<UnifiedQueryRestState>,
-    identity: Option<Extension<proximadb_tenant::ResolvedRequestIdentity>>,
+    identity: QueryIdentity,
     body: Result<Json<PreparedStatsRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     let req = parse_body!(body);
     match s
         .unified_query_port
-        .get_prepared_stats(req.statement_ids, port_context(&identity))
+        .get_prepared_stats(req.statement_ids, identity.port_context())
         .await
     {
         Ok(result) => Json(result).into_response(),
@@ -395,8 +411,11 @@ async fn get_prepared_stats(
 
 /// Build the unified multi-model query router.
 ///
-/// All routes delegate to `UnifiedQueryPort`.  The root-crate implementation
-/// returns `501 Not Implemented` until Phase 9.9/9.10 is complete.
+/// The containing router supplies the shared tenant middleware, which stamps
+/// a `ResolvedRequestIdentity` extension. A missing or empty tenant identity
+/// receives a 401 with the unified query JSON error envelope.
+///
+/// All routes delegate to `UnifiedQueryPort`.
 pub fn create_multimodal_router() -> Router<UnifiedQueryRestState> {
     super::with_v1_compatibility_headers(
         Router::new()
@@ -431,6 +450,15 @@ mod tests {
         http::{Request, header::CONTENT_TYPE},
     };
     use tower::ServiceExt;
+
+    fn identity() -> QueryIdentity {
+        QueryIdentity(ResolvedRequestIdentity {
+            tenant: "tenant-a".to_owned(),
+            subject: Some("alice".to_owned()),
+            auth_class: proximadb_tenant::AuthClass::Authenticated,
+            tenant_stable_id: Some(7),
+        })
+    }
 
     #[derive(Clone, Copy)]
     enum MockMode {
@@ -603,7 +631,7 @@ mod tests {
     async fn handlers_validate_empty_queries_before_delegating() {
         let execute = execute_query(
             MockUnifiedQueryPort::state(MockMode::Ok),
-            None,
+            identity(),
             Ok(Json(ExecuteQueryRequest {
                 query: " ".to_string(),
                 parameters: None,
@@ -617,7 +645,7 @@ mod tests {
 
         let federated = execute_federated_query(
             MockUnifiedQueryPort::state(MockMode::Ok),
-            None,
+            identity(),
             Ok(Json(ExecuteFederatedRequest {
                 query: "\n".to_string(),
                 parameters: None,
@@ -635,7 +663,7 @@ mod tests {
         assert_eq!(
             execute_query(
                 state.clone(),
-                None,
+                identity(),
                 Ok(Json(ExecuteQueryRequest {
                     query: "select * from docs".to_string(),
                     parameters: Some(vec![serde_json::json!("p1")]),
@@ -651,7 +679,7 @@ mod tests {
         assert_eq!(
             execute_multi_model_query(
                 state.clone(),
-                None,
+                identity(),
                 Ok(Json(serde_json::json!({"vector": {}}))),
             )
             .await
@@ -662,7 +690,7 @@ mod tests {
         assert_eq!(
             execute_federated_query(
                 state.clone(),
-                None,
+                identity(),
                 Ok(Json(ExecuteFederatedRequest {
                     query: "select * from docs".to_string(),
                     parameters: Some(vec![serde_json::json!(1)]),
@@ -676,7 +704,7 @@ mod tests {
         assert_eq!(
             execute_distributed_query(
                 state.clone(),
-                None,
+                identity(),
                 Ok(Json(serde_json::json!({"shards": []}))),
             )
             .await
@@ -687,7 +715,7 @@ mod tests {
         assert_eq!(
             explain_query(
                 state.clone(),
-                None,
+                identity(),
                 Ok(Json(ExplainQueryRequest {
                     query: "select * from docs".to_string(),
                     collection: Some("docs".to_string()),
@@ -701,7 +729,7 @@ mod tests {
         assert_eq!(
             prepare_statement(
                 state.clone(),
-                None,
+                identity(),
                 Ok(Json(PrepareStatementRequest {
                     query: "select * from docs".to_string(),
                     name: Some("q1".to_string()),
@@ -717,7 +745,7 @@ mod tests {
         assert_eq!(
             execute_prepared_statement(
                 state.clone(),
-                None,
+                identity(),
                 Path("stmt-1".to_string()),
                 Ok(Json(ExecutePreparedRequest {
                     parameters: Some(vec![serde_json::json!(true)]),
@@ -730,7 +758,7 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            delete_prepared_statement(state.clone(), None, Path("stmt-1".to_string()))
+            delete_prepared_statement(state.clone(), identity(), Path("stmt-1".to_string()))
                 .await
                 .into_response()
                 .status(),
@@ -739,7 +767,7 @@ mod tests {
         assert_eq!(
             get_prepared_stats(
                 state,
-                None,
+                identity(),
                 Ok(Json(PreparedStatsRequest {
                     statement_ids: vec!["stmt-1".to_string()],
                 })),
@@ -755,7 +783,7 @@ mod tests {
     async fn handlers_map_not_implemented_and_internal_errors_to_expected_statuses() {
         let not_implemented = execute_multi_model_query(
             MockUnifiedQueryPort::state(MockMode::NotImplemented),
-            None,
+            identity(),
             Ok(Json(serde_json::json!({}))),
         )
         .await
@@ -764,7 +792,7 @@ mod tests {
 
         let invalid_input = execute_multi_model_query(
             MockUnifiedQueryPort::state(MockMode::InvalidInput),
-            None,
+            identity(),
             Ok(Json(serde_json::json!({}))),
         )
         .await
@@ -773,7 +801,7 @@ mod tests {
 
         let internal = execute_distributed_query(
             MockUnifiedQueryPort::state(MockMode::Internal),
-            None,
+            identity(),
             Ok(Json(serde_json::json!({}))),
         )
         .await
@@ -786,17 +814,19 @@ mod tests {
     #[tokio::test]
     async fn port_deadline_maps_to_gateway_timeout_on_every_unified_surface() {
         let state = || MockUnifiedQueryPort::state(MockMode::Deadline);
-        let multi_model = execute_multi_model_query(state(), None, Ok(Json(serde_json::json!({}))))
-            .await
-            .into_response();
+        let multi_model =
+            execute_multi_model_query(state(), identity(), Ok(Json(serde_json::json!({}))))
+                .await
+                .into_response();
         assert_eq!(multi_model.status(), StatusCode::GATEWAY_TIMEOUT);
-        let distributed = execute_distributed_query(state(), None, Ok(Json(serde_json::json!({}))))
-            .await
-            .into_response();
+        let distributed =
+            execute_distributed_query(state(), identity(), Ok(Json(serde_json::json!({}))))
+                .await
+                .into_response();
         assert_eq!(distributed.status(), StatusCode::GATEWAY_TIMEOUT);
         let execute = execute_query(
             state(),
-            None,
+            identity(),
             Ok(Json(ExecuteQueryRequest {
                 query: "SELECT 1".to_string(),
                 parameters: None,
@@ -810,9 +840,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_rejections_use_bare_error_envelope() {
+    async fn every_unified_route_requires_resolved_identity() {
         let router =
             create_multimodal_router().with_state(MockUnifiedQueryPort::state(MockMode::Ok).0);
+        for (method, uri) in [
+            ("POST", "/execute"),
+            ("POST", "/multi-model"),
+            ("POST", "/federated"),
+            ("POST", "/distributed"),
+            ("POST", "/explain"),
+            ("POST", "/prepare"),
+            ("POST", "/execute/test-statement"),
+            ("DELETE", "/prepared/test-statement"),
+            ("POST", "/prepared/stats"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"query":"SELECT 1"}"#))
+                        .expect("build request"),
+                )
+                .await
+                .expect("execute request");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_query_rejects_blank_resolved_tenant() {
+        let mut blank = identity().0;
+        blank.tenant = " ".to_owned();
+        let response = create_multimodal_router()
+            .with_state(MockUnifiedQueryPort::state(MockMode::Ok).0)
+            .layer(axum::Extension(blank))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"query":"SELECT 1"}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("execute request");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn json_rejections_use_bare_error_envelope() {
+        let router = create_multimodal_router()
+            .with_state(MockUnifiedQueryPort::state(MockMode::Ok).0)
+            .layer(axum::Extension(identity().0));
         let cases = [
             ("application/json", "{\"query\":", StatusCode::BAD_REQUEST),
             (
