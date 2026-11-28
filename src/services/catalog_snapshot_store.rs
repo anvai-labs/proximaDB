@@ -129,9 +129,13 @@ pub trait CatalogSnapshotStore: Send + Sync {
     // is (it is the local-store path AND the kill-switch escape path). The
     // sharded surface below splits one whole-image blob into a small ROOT
     // manifest log (global registries + the `account → shard log version`
-    // index) plus one SHARD manifest log per account, each a sibling of the
-    // whole-image log, committed through the same generation-fenced
-    // [`ManifestCommitter`]. Defaults make every non-object store (local fs,
+    // index) at `_operator/catalog/_root/`, plus one SHARD manifest log per
+    // account. A tenant's shard sits under its own tenant prefix,
+    // `data/{tenant}/_syscat/shard/`, built by `DrPathBuilder`; the untenanted
+    // `_default` shard sits beside the root at
+    // `_operator/catalog/_untenanted_shard/`. All are committed through the
+    // same generation-fenced [`ManifestCommitter`]. Defaults make every
+    // non-object store (local fs,
     // injected test stores) report "unsupported", which the catalog reads as
     // "keep the whole-image path".
 
@@ -169,9 +173,18 @@ pub trait CatalogSnapshotStore: Send + Sync {
     }
 
     /// Commit the ROOT record at `generation` (carrying the caller's
-    /// post-shard-commit index). Fenced/conflicting outcomes surface as
-    /// [`SnapshotWrite::Fenced`], exactly like [`Self::write_atomic`].
-    async fn commit_root(&self, _generation: u64, _root_bytes: &[u8]) -> Result<SnapshotWrite> {
+    /// post-shard-commit index) as the successor of `expected_parent` — the
+    /// root version the caller CHECKED (`None` = the caller saw no root).
+    /// TD-SPINE-2 R4: the parent is never re-read here; a root committed by
+    /// another owner after the caller's check moves the tip past
+    /// `expected_parent`, and the CAS refuses. Fenced/conflicting outcomes
+    /// surface as [`SnapshotWrite::Fenced`], exactly like [`Self::write_atomic`].
+    async fn commit_root(
+        &self,
+        _generation: u64,
+        _expected_parent: Option<u64>,
+        _root_bytes: &[u8],
+    ) -> Result<SnapshotWrite> {
         anyhow::bail!("store does not support sharded catalog snapshots")
     }
 
@@ -392,9 +405,6 @@ pub struct ObjectStoreSnapshotStore {
     /// (`_operator/catalog/_root/` in the canonical wiring, derived via
     /// `DrPathBuilder` so the two can never drift; pinned by test).
     root_committer: ManifestCommitter,
-    /// TD-SPINE-2: the whole-image log prefix this store was opened at; the
-    /// root and per-account shard logs are derived from it as siblings.
-    manifests_prefix: String,
     /// TD-PATH-2 4a: the same backing store the committer resolves relative
     /// paths against, used for the sidecar object beside the manifest log.
     sidecar_store: ProximaObjectStore,
@@ -479,22 +489,87 @@ impl ObjectStoreSnapshotStore {
                 .with_legacy_encoding(
                     proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
                 ),
-            manifests_prefix,
             sidecar_store: store,
             sidecar_key,
             label,
         }
     }
 
-    /// TD-SPINE-2: one account's shard manifest log — also a DrPathBuilder-
-    /// derived sibling of the whole-image log. Fresh per call: a committer is
-    /// a thin (store-clone + prefix) handle, and accounts are unbounded.
-    fn shard_committer(&self, account: &str) -> ManifestCommitter {
-        let prefix = crate::storage::trait_components::path_resolver::DrPathBuilder::system_catalog_shard_manifests_subprefix_from(&self.manifests_prefix, account);
-        ManifestCommitter::new(self.sidecar_store.clone(), prefix).with_legacy_encoding(
-            proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+    /// TD-SPINE-2 R1: one account's shard manifest log, at
+    /// [`catalog_shard_manifests_prefix`]. Fresh per call: a committer is a
+    /// thin (store-clone + prefix) handle, and accounts are unbounded.
+    fn shard_committer(&self, account: &str) -> Result<ManifestCommitter> {
+        let prefix = catalog_shard_manifests_prefix(account)?;
+        Ok(
+            ManifestCommitter::new(self.sidecar_store.clone(), prefix).with_legacy_encoding(
+                proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+            ),
         )
     }
+}
+
+/// TD-SPINE-2 R1 (round-1 LOW-1/MED-1): the account ids among `accounts`
+/// whose shard cannot be placed injectively — not a valid tenant segment, or
+/// equal to another account up to ASCII case (one directory on a
+/// case-insensitive store). Sorted, for a stable error message.
+pub fn catalog_shard_placement_violations(
+    accounts: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    // Round-2 MED-1: the untenanted key is placed under `_operator/`, never
+    // under `data/`, so it cannot physically collide with a tenant and is
+    // excluded from the case-fold count (a legacy `_DEFAULT` tenant is judged
+    // by the placement rule alone).
+    let untenanted = crate::services::system_catalog_state::DEFAULT_SHARD_KEY;
+    let mut by_fold: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for account in accounts
+        .iter()
+        .filter(|account| account.as_str() != untenanted)
+    {
+        *by_fold.entry(account.to_ascii_lowercase()).or_default() += 1;
+    }
+    let mut violations: Vec<String> = accounts
+        .iter()
+        .filter(|account| {
+            catalog_shard_manifests_prefix(account).is_err()
+                || (account.as_str() != untenanted
+                    && by_fold
+                        .get(&account.to_ascii_lowercase())
+                        .is_some_and(|count| *count > 1))
+        })
+        .cloned()
+        .collect();
+    violations.sort();
+    violations
+}
+
+/// TD-SPINE-2 R1 (ADR-098 D1.3): the object-store prefix of one account's
+/// catalog shard manifest log.
+///
+/// * A tenant's shard lives under that tenant's `DrPathBuilder` prefix:
+///   `data/{tenant_id}/_syscat/shard/` — catalog isolation is structural
+///   (CLAUDE.md co-design mandate 3), not a naming convention inside a shared
+///   operator prefix.
+/// * The untenanted shard ([`DEFAULT_SHARD_KEY`](crate::services::system_catalog_state::DEFAULT_SHARD_KEY),
+///   namespaces created with no tenant) has no tenant prefix to live under;
+///   it is operator-scoped beside the root:
+///   `_operator/catalog/_untenanted_shard/`.
+///
+/// Injective: `_default` is the only key mapped outside `data/`, and
+/// `SystemCatalog` refuses it as a namespace tenant id; every other key must
+/// be a valid `DrPathBuilder` tenant segment and maps to itself. A key that
+/// is not a valid segment fails closed with an actionable error — it is
+/// never escaped or re-encoded into a prefix another tenant could own.
+pub fn catalog_shard_manifests_prefix(account: &str) -> Result<String> {
+    use crate::storage::trait_components::path_resolver::DrPathBuilder;
+    if account == crate::services::system_catalog_state::DEFAULT_SHARD_KEY {
+        return Ok(DrPathBuilder::system_catalog_untenanted_shard_manifests_subprefix());
+    }
+    DrPathBuilder::system_catalog_tenant_shard_manifests_subprefix(account).map_err(|e| {
+        anyhow::anyhow!(
+            "catalog shard for account '{account}' cannot be placed under a tenant \
+             prefix ({e}); the account id must be a valid DrPathBuilder tenant segment"
+        )
+    })
 }
 
 #[async_trait]
@@ -592,9 +667,14 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
         generation: u64,
         shards: &[(String, Vec<u8>)],
     ) -> Result<ShardCommit> {
+        // Resolve every placement before the first PUT, so an unplaceable
+        // account never leaves a half-written publish behind.
+        let committers = shards
+            .iter()
+            .map(|(account, _)| self.shard_committer(account))
+            .collect::<Result<Vec<_>>>()?;
         let mut versions = std::collections::HashMap::with_capacity(shards.len());
-        for (account, bytes) in shards {
-            let committer = self.shard_committer(account);
+        for ((account, bytes), committer) in shards.iter().zip(committers) {
             let parent = committer.latest_version().await.with_context(|| {
                 format!("reading catalog shard '{account}' head at {}", self.label)
             })?;
@@ -618,16 +698,20 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
         Ok(ShardCommit::Committed(versions))
     }
 
-    async fn commit_root(&self, generation: u64, root_bytes: &[u8]) -> Result<SnapshotWrite> {
-        let parent = self
-            .root_committer
-            .latest_version()
-            .await
-            .with_context(|| format!("reading catalog snapshot root head {}", self.label))?;
+    async fn commit_root(
+        &self,
+        generation: u64,
+        expected_parent: Option<u64>,
+        root_bytes: &[u8],
+    ) -> Result<SnapshotWrite> {
+        // TD-SPINE-2 R4: CAS against the CALLER's checked parent, never a
+        // fresh `latest_version()` read — a root another owner committed
+        // after the caller's coverage check must refuse this commit
+        // (`commit_fenced` returns `Conflict` when `parent != latest`).
         match self
             .root_committer
             .commit_fenced(
-                parent,
+                expected_parent,
                 generation,
                 bytes::Bytes::copy_from_slice(root_bytes),
             )
@@ -640,20 +724,36 @@ impl CatalogSnapshotStore for ObjectStoreSnapshotStore {
     }
 
     async fn read_shard(&self, account: &str) -> Result<Option<SnapshotRead>> {
-        read_log_tip(&self.shard_committer(account), account, &self.label).await
+        read_log_tip(&self.shard_committer(account)?, account, &self.label).await
     }
 
     async fn read_shard_version(&self, account: &str, version: u64) -> Result<SnapshotRead> {
-        let (generation, bytes) = self
-            .shard_committer(account)
-            .read_fenced(version)
-            .await
-            .with_context(|| {
-                format!(
-                    "reading catalog shard '{account}' at {}@{version}",
-                    self.label
-                )
-            })?;
+        let prefix = catalog_shard_manifests_prefix(account)?;
+        let (generation, bytes) = match self.shard_committer(account)?.read_fenced(version).await {
+            Ok(read) => read,
+            // TD-SPINE-2 R1: fail closed, loudly. The root names this exact
+            // version, so its absence is never "an empty account". The likely
+            // cause after R1 is a store written before the relocation (shards
+            // under the retired `_operator/catalog/_shards/`), which this
+            // reader deliberately does not consult (pre-GA clean break).
+            Err(proximadb_kernel::error::StorageError::NotFound(_)) => anyhow::bail!(
+                "catalog root names shard v{version} of account '{account}', but it is \
+                 missing at '{prefix}' ({}). Shards live under the tenant prefix since \
+                 TD-SPINE-2 R1; a store written before R1 (shards under \
+                 '_operator/catalog/_shards/') is not read. Re-seed the catalog from the \
+                 legacy whole-image log or restore the object store; refusing to serve \
+                 the account without its catalog rows",
+                self.label
+            ),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "reading catalog shard '{account}' at {}@{version} ({prefix})",
+                        self.label
+                    )
+                });
+            }
+        };
         Ok(SnapshotRead {
             version,
             generation,
@@ -997,7 +1097,7 @@ mod tests {
         assert_eq!(committed["acme"], 0);
         assert_eq!(committed["globex"], 0);
         assert_eq!(
-            store.commit_root(2, b"root-v1").await?,
+            store.commit_root(2, None, b"root-v1").await?,
             SnapshotWrite::Published { version: 0 }
         );
         let root = store.read_root().await?.expect("root");
@@ -1017,7 +1117,7 @@ mod tests {
             ShardCommit::Fenced
         );
         assert_eq!(
-            store.commit_root(1, b"stale-root").await?,
+            store.commit_root(1, Some(0), b"stale-root").await?,
             SnapshotWrite::Fenced
         );
         assert_eq!(
@@ -1031,16 +1131,16 @@ mod tests {
         Ok(())
     }
 
-    /// The shard and root logs live at the DrPathBuilder-derived sibling
-    /// prefixes of the whole-image log (`_operator/catalog/_shards/{hex}/`,
-    /// `_operator/catalog/_root/`), NOT inside the legacy `_manifests/`
-    /// prefix — a legacy reader's LIST of the whole-image log never sees
-    /// them, and per-account prefixes are structurally distinct.
+    /// TD-SPINE-2 R1: each tenant's shard log lives under THAT tenant's
+    /// DrPathBuilder prefix (`data/{tenant}/_syscat/shard/`), the untenanted
+    /// shard beside the root under `_operator/catalog/`, the root at
+    /// `_operator/catalog/_root/` — and nothing under the retired
+    /// `_operator/catalog/_shards/`, nor inside the legacy `_manifests/` log.
     #[tokio::test]
-    async fn shard_and_root_objects_land_on_drpath_sibling_prefixes() -> Result<()> {
+    async fn shard_objects_land_under_their_tenant_prefix_root_stays_operator_scoped() -> Result<()>
+    {
         use futures::TryStreamExt;
         use object_store::ObjectStore;
-        use object_store::path::Path;
 
         let inner = std::sync::Arc::new(object_store::memory::InMemory::new());
         let backing = ProximaObjectStore::new(inner.clone());
@@ -1050,34 +1150,174 @@ mod tests {
             DrPathBuilder::system_catalog_manifests_subprefix(),
         );
         store
-            .commit_shards(1, &[("tenant one/x".to_string(), b"s".to_vec())])
+            .commit_shards(
+                1,
+                &[
+                    ("tenant-a".to_string(), b"a".to_vec()),
+                    ("tenant-b".to_string(), b"b".to_vec()),
+                    (
+                        crate::services::system_catalog_state::DEFAULT_SHARD_KEY.to_string(),
+                        b"d".to_vec(),
+                    ),
+                ],
+            )
             .await?;
-        store.commit_root(1, b"r").await?;
+        store.commit_root(1, None, b"r").await?;
 
         // Flat (recursive) list — `list_with_delimiter` would stop at the
-        // `_operator/` common prefix.
+        // top-level common prefixes.
         let mut keys: Vec<String> = inner
             .list(None)
             .map_ok(|meta| meta.location.to_string())
             .try_collect()
             .await?;
         keys.sort();
-        // Hex encoding: even a separator-bearing tenant id becomes one
-        // path-safe segment.
-        let hex = DrPathBuilder::encode_system_catalog_shard_segment("tenant one/x");
-        assert!(!hex.contains('/'));
         assert_eq!(
             keys,
             vec![
-                format!("_operator/catalog/_root/v00000000000000000000.manifest"),
-                format!("_operator/catalog/_shards/{hex}/v00000000000000000000.manifest"),
+                "_operator/catalog/_root/v00000000000000000000.manifest".to_string(),
+                "_operator/catalog/_untenanted_shard/v00000000000000000000.manifest".to_string(),
+                "data/tenant-a/_syscat/shard/v00000000000000000000.manifest".to_string(),
+                "data/tenant-b/_syscat/shard/v00000000000000000000.manifest".to_string(),
             ]
         );
+        assert!(
+            keys.iter()
+                .all(|k| !k.starts_with("_operator/catalog/_shards/"))
+        );
         assert_eq!(
-            Path::from(format!("_operator/catalog/_shards/{hex}/").as_str()),
-            Path::from(
-                DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant one/x").as_str()
+            catalog_shard_manifests_prefix("tenant-a")?,
+            DrPathBuilder::build_tenant_system(None, "tenant-a")?.system_catalog_shard_subprefix()
+        );
+        // The shard reads back from the relocated log.
+        assert_eq!(store.read_shard_version("tenant-a", 0).await?.bytes, b"a");
+        Ok(())
+    }
+
+    /// TD-SPINE-2 R1: an account id that is not a valid tenant path segment
+    /// fails closed on commit (no object is written anywhere) instead of
+    /// being escaped into a prefix another tenant could own.
+    #[tokio::test]
+    async fn shard_commit_refuses_an_account_that_is_not_a_tenant_segment() -> Result<()> {
+        use futures::TryStreamExt;
+        use object_store::ObjectStore;
+
+        let inner = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = ObjectStoreSnapshotStore::new(
+            ProximaObjectStore::new(inner.clone()),
+            "memory:///",
+            DrPathBuilder::system_catalog_manifests_subprefix(),
+        );
+        let error = store
+            .commit_shards(
+                1,
+                &[
+                    // A valid account FIRST: it must not be written either
+                    // (every placement resolves before the first PUT).
+                    ("tenant-a".to_string(), b"a".to_vec()),
+                    ("tenant one/x".to_string(), b"s".to_vec()),
+                ],
             )
+            .await
+            .expect_err("a separator-bearing account must be refused");
+        assert!(
+            format!("{error:#}").contains("cannot be placed under a tenant prefix"),
+            "{error:#}"
+        );
+        let keys: Vec<_> = inner.list(None).try_collect().await?;
+        assert!(keys.is_empty(), "nothing may be written: {keys:?}");
+        Ok(())
+    }
+
+    /// TD-SPINE-2 R1: a root that names a shard version missing at the
+    /// relocated prefix fails closed with an actionable error — even when a
+    /// pre-R1 copy of that shard still sits under the retired
+    /// `_operator/catalog/_shards/{hex}/` layout (no dual read).
+    #[tokio::test]
+    async fn missing_relocated_shard_fails_closed_and_ignores_the_retired_layout() -> Result<()> {
+        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt as _;
+
+        let inner = std::sync::Arc::new(object_store::memory::InMemory::new());
+        // A pre-R1 shard object for `acme` at the retired location
+        // (`hex("acme")` = 61636d65), generation-prefixed like the real log.
+        let mut legacy = 1u64.to_be_bytes().to_vec();
+        legacy.extend_from_slice(b"acme-shard");
+        inner
+            .put(
+                &object_store::path::Path::from(
+                    "_operator/catalog/_shards/61636d65/v00000000000000000000.manifest",
+                ),
+                legacy.into(),
+            )
+            .await?;
+        let store = ObjectStoreSnapshotStore::new(
+            ProximaObjectStore::new(inner.clone() as std::sync::Arc<dyn ObjectStore>),
+            "memory:///",
+            DrPathBuilder::system_catalog_manifests_subprefix(),
+        );
+        let error = store
+            .read_shard_version("acme", 0)
+            .await
+            .expect_err("a root-named shard missing at the new location must fail closed");
+        let text = format!("{error:#}");
+        assert!(text.contains("data/acme/_syscat/shard/"), "{text}");
+        assert!(text.contains("TD-SPINE-2 R1"), "{text}");
+        assert!(text.contains("Re-seed"), "{text}");
+        assert!(store.read_shard("acme").await?.is_none());
+        Ok(())
+    }
+
+    /// Round-1 MED-1/LOW-1: placement violations name every unplaceable id
+    /// (invalid segment) and every case-fold collision, and nothing else.
+    #[test]
+    fn placement_violations_list_invalid_and_case_colliding_ids() {
+        let accounts: std::collections::HashSet<String> =
+            ["tenantA", "tenanta", "bad tenant", "ok", "_default"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        assert_eq!(
+            catalog_shard_placement_violations(&accounts),
+            vec!["bad tenant", "tenantA", "tenanta"]
+        );
+    }
+
+    /// Round-2 MED-1: `_default` (placed under `_operator/`) is never a
+    /// case-fold collision with a `_DEFAULT` tenant.
+    #[test]
+    fn placement_violations_ignore_the_untenanted_key_for_case_folding() {
+        let accounts: std::collections::HashSet<String> = ["_default", "_DEFAULT", "ok"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(catalog_shard_placement_violations(&accounts).is_empty());
+    }
+
+    /// TD-SPINE-2 R4: the root CAS is against the CALLER's expected parent.
+    /// Another owner's root that landed after the caller checked version 0
+    /// makes the commit refuse (`Fenced`), even at an equal generation, and
+    /// the other owner's root stays the tip.
+    #[tokio::test]
+    async fn root_commit_refuses_a_stale_expected_parent() -> Result<()> {
+        let store = ObjectStoreSnapshotStore::new(
+            ProximaObjectStore::new(std::sync::Arc::new(object_store::memory::InMemory::new())),
+            "memory:///",
+            DrPathBuilder::system_catalog_manifests_subprefix(),
+        );
+        assert!(published(store.commit_root(3, None, b"seed").await?));
+        // The caller checked v0; another equal-generation owner lands v1.
+        assert!(published(
+            store.commit_root(3, Some(0), b"other-owner").await?
+        ));
+        assert_eq!(
+            store.commit_root(3, Some(0), b"checked-at-v0").await?,
+            SnapshotWrite::Fenced
+        );
+        let tip = store.read_root().await?.expect("root");
+        assert_eq!(
+            (tip.version, tip.bytes.as_slice()),
+            (1, &b"other-owner"[..])
         );
         Ok(())
     }

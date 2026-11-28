@@ -566,6 +566,24 @@ impl DrTenantSystemPath {
     pub fn cache_subprefix(&self) -> String {
         format!("{}_cache/", self.tenant_root())
     }
+
+    /// TD-SPINE-2 R1 (ADR-098 D1.3): the tenant's **system-catalog shard**
+    /// manifest log `<tenant_root>_syscat/shard/`. Each account's catalog
+    /// shard (its namespaces, tables and statistics) is published here, under
+    /// the tenant's own prefix, so catalog isolation is structural: a DDL in
+    /// one tenant never writes under another tenant's prefix. `_syscat` is
+    /// the reserved per-tenant system-catalog segment (`validate_id` refuses
+    /// it as a user id); the `shard/` leaf is disjoint from the NativeCatalog
+    /// `_syscat/` names (`objects/`, `index.json`, `account_registry.json`,
+    /// `identity_high_water.json`).
+    pub fn system_catalog_shard_subprefix(&self) -> String {
+        format!(
+            "{}{}/{}/",
+            self.tenant_root(),
+            DrPathBuilder::TENANT_SYSTEM_CATALOG_SEGMENT,
+            DrPathBuilder::TENANT_SYSTEM_CATALOG_SHARD_LEAF
+        )
+    }
 }
 
 /// ADR-031 Phase 4c: typed collection **WAL** directory path.
@@ -1211,25 +1229,20 @@ impl DrPathBuilder {
     /// high-waters and the `account → shard log version` index.
     pub const SYSTEM_CATALOG_ROOT_SUBPATH: &'static str = "_root";
 
-    /// Reserved segment holding the sharded catalog snapshot's **per-account
-    /// shard** manifest logs (TD-SPINE-2 / ADR-098 D1.3): one manifest log
-    /// per account under `_shards/{encoded-account}/`.
-    pub const SYSTEM_CATALOG_SHARDS_SUBPATH: &'static str = "_shards";
+    /// TD-SPINE-2 R1: the reserved per-tenant system-catalog segment
+    /// (listed in [`RESERVED_SYSTEM_SEGMENTS`](Self::RESERVED_SYSTEM_SEGMENTS)).
+    pub const TENANT_SYSTEM_CATALOG_SEGMENT: &'static str = "_syscat";
 
-    /// TD-SPINE-2: encode an account (shard key) into a path-safe manifest-log
-    /// segment. Hex (2× length, `[0-9a-f]`) so ANY account string — including
-    /// non-ASCII or separator-bearing tenant ids — maps to exactly one valid
-    /// single path segment with no escaping and no validation failure; the
-    /// mapping is deterministic and injective, so distinct accounts never
-    /// share a shard log.
-    pub fn encode_system_catalog_shard_segment(account: &str) -> String {
-        let mut encoded = String::with_capacity(account.len() * 2);
-        for byte in account.bytes() {
-            use std::fmt::Write as _;
-            let _ = write!(encoded, "{byte:02x}");
-        }
-        encoded
-    }
+    /// TD-SPINE-2 R1: leaf under [`TENANT_SYSTEM_CATALOG_SEGMENT`](Self::TENANT_SYSTEM_CATALOG_SEGMENT)
+    /// holding the tenant's catalog shard manifest log.
+    pub const TENANT_SYSTEM_CATALOG_SHARD_LEAF: &'static str = "shard";
+
+    /// TD-SPINE-2 R1: reserved segment under the operator catalog prefix that
+    /// holds the **untenanted** shard (namespaces created with no tenant —
+    /// the single-tenant / OSS default). No tenant exists for those rows, so
+    /// there is no tenant prefix to place them under; they are the
+    /// deployment's own objects and stay operator-scoped beside the root.
+    pub const SYSTEM_CATALOG_UNTENANTED_SHARD_SUBPATH: &'static str = "_untenanted_shard";
 
     /// TD-SPINE-2: relative prefix of the sharded catalog snapshot's **root**
     /// manifest log: `_operator/catalog/_root/` (sibling of the legacy
@@ -1242,16 +1255,28 @@ impl DrPathBuilder {
         )
     }
 
-    /// TD-SPINE-2: relative prefix of one account's **shard** manifest log:
-    /// `_operator/catalog/_shards/{hex(account)}/`. Structural per-account
-    /// isolation (ADR-098 D1.3): a DDL publishes only its account's shard
-    /// object under this prefix, never a fleet-wide image.
-    pub fn system_catalog_shard_manifests_subprefix(account: &str) -> String {
+    /// TD-SPINE-2 R1: relative prefix of one tenant's catalog **shard**
+    /// manifest log, under that tenant's `DrPathBuilder` prefix:
+    /// `data/{tenant_id}/_syscat/shard/`. The tenant id runs through
+    /// [`validate_id`](Self::validate_id), so the mapping from a valid tenant
+    /// id to its prefix is the identity on the segment (injective, and it
+    /// cannot escape the tenant root); an id that is not a valid path segment
+    /// is refused, never escaped into some other tenant's prefix.
+    pub fn system_catalog_tenant_shard_manifests_subprefix(
+        tenant_id: &str,
+    ) -> Result<String, PathResolverError> {
+        Ok(Self::build_tenant_system(None, tenant_id)?.system_catalog_shard_subprefix())
+    }
+
+    /// TD-SPINE-2 R1: relative prefix of the **untenanted** shard's manifest
+    /// log: `_operator/catalog/_untenanted_shard/`. Operator-scoped because
+    /// its rows have no tenant (see
+    /// [`SYSTEM_CATALOG_UNTENANTED_SHARD_SUBPATH`](Self::SYSTEM_CATALOG_UNTENANTED_SHARD_SUBPATH)).
+    pub fn system_catalog_untenanted_shard_manifests_subprefix() -> String {
         format!(
-            "{}{}/{}/",
+            "{}{}/",
             Self::system_catalog_subprefix(),
-            Self::SYSTEM_CATALOG_SHARDS_SUBPATH,
-            Self::encode_system_catalog_shard_segment(account)
+            Self::SYSTEM_CATALOG_UNTENANTED_SHARD_SUBPATH
         )
     }
 
@@ -1267,26 +1292,6 @@ impl DrPathBuilder {
             Some(idx) => format!("{}/{}/", &trimmed[..idx], Self::SYSTEM_CATALOG_ROOT_SUBPATH),
             None => format!("{}/", Self::SYSTEM_CATALOG_ROOT_SUBPATH),
         }
-    }
-
-    /// TD-SPINE-2: derive one account's shard-log prefix as a sibling of an
-    /// arbitrary system-catalog manifests prefix (canonical equivalence
-    /// pinned by test).
-    pub fn system_catalog_shard_manifests_subprefix_from(
-        manifests_prefix: &str,
-        account: &str,
-    ) -> String {
-        let trimmed = manifests_prefix.trim_end_matches('/');
-        let parent = match trimmed.rfind('/') {
-            Some(idx) => &trimmed[..idx],
-            None => "",
-        };
-        format!(
-            "{}/{}/{}/",
-            parent,
-            Self::SYSTEM_CATALOG_SHARDS_SUBPATH,
-            Self::encode_system_catalog_shard_segment(account)
-        )
     }
 }
 
@@ -2036,38 +2041,51 @@ mod tests {
         );
     }
 
-    /// TD-SPINE-2: shard segments are pure lowercase hex — any account string
-    /// (non-ASCII, separators, traversal) maps to exactly one path-safe
-    /// single segment, and distinct accounts never collide.
+    /// TD-SPINE-2 R1: a tenant's catalog shard log lives under that tenant's
+    /// DrPathBuilder prefix; distinct tenants get disjoint prefixes; hostile
+    /// ids (separators, traversal, whitespace, non-ASCII, reserved segments)
+    /// are refused rather than escaped into another prefix; the untenanted
+    /// shard is operator-scoped and outside every tenant tree.
     #[test]
-    fn system_catalog_shard_segment_is_path_safe_hex() {
-        assert_eq!(
-            DrPathBuilder::encode_system_catalog_shard_segment("tenant-one"),
-            "74656e616e742d6f6e65"
-        );
-        // Hostile ids cannot escape the segment: separators, traversal and
-        // non-ASCII all encode to hex.
-        for hostile in ["a/b", "..", "\u{4e2d}\u{6587}", "a b", "\0"] {
-            let segment = DrPathBuilder::encode_system_catalog_shard_segment(hostile);
+    fn system_catalog_tenant_shard_prefix_is_under_the_tenant_root() {
+        let a =
+            DrPathBuilder::system_catalog_tenant_shard_manifests_subprefix("tenant-one").unwrap();
+        assert_eq!(a, "data/tenant-one/_syscat/shard/");
+        let tenant_root = DrPathBuilder::build_tenant_system(None, "tenant-one")
+            .unwrap()
+            .tenant_root();
+        assert!(a.starts_with(&tenant_root));
+        let b =
+            DrPathBuilder::system_catalog_tenant_shard_manifests_subprefix("tenant-onex").unwrap();
+        assert!(!a.starts_with(&b) && !b.starts_with(&a), "{a} vs {b}");
+        for hostile in [
+            "a/b",
+            "..",
+            "\u{4e2d}\u{6587}",
+            "a b",
+            "\0",
+            "",
+            "_operator",
+            "_syscat",
+        ] {
             assert!(
-                segment.chars().all(|c| c.is_ascii_hexdigit()),
-                "segment must be hex: {segment}"
+                DrPathBuilder::system_catalog_tenant_shard_manifests_subprefix(hostile).is_err(),
+                "hostile tenant id {hostile:?} must be refused"
             );
-            assert!(!segment.contains('/'));
         }
-        assert_ne!(
-            DrPathBuilder::encode_system_catalog_shard_segment("a"),
-            DrPathBuilder::encode_system_catalog_shard_segment("b")
-        );
+        let untenanted = DrPathBuilder::system_catalog_untenanted_shard_manifests_subprefix();
+        assert_eq!(untenanted, "_operator/catalog/_untenanted_shard/");
+        assert!(!untenanted.starts_with("data/"));
     }
 
-    /// TD-SPINE-2: the canonical root/shard prefixes live beside the legacy
+    /// TD-SPINE-2: the canonical root prefix lives beside the legacy
     /// whole-image log, and the sibling derivation from the canonical
-    /// manifests prefix is byte-identical to the canonical builders — the
-    /// snapshot store opens at the manifests prefix and derives its root and
-    /// shard logs, so the two must never drift.
+    /// manifests prefix is byte-identical to the canonical builder — the
+    /// snapshot store opens at the manifests prefix and derives its root
+    /// log, so the two must never drift. (Shards moved under the tenant
+    /// prefix in R1; see `system_catalog_tenant_shard_prefix_is_under_the_tenant_root`.)
     #[test]
-    fn system_catalog_root_and_shard_prefixes_are_canonical_siblings() {
+    fn system_catalog_root_prefix_is_a_canonical_sibling() {
         let canonical = DrPathBuilder::system_catalog_manifests_subprefix();
         assert_eq!(canonical, "_operator/catalog/_manifests/");
         assert_eq!(
@@ -2077,14 +2095,6 @@ mod tests {
         assert_eq!(
             DrPathBuilder::system_catalog_root_manifests_subprefix_from(&canonical),
             DrPathBuilder::system_catalog_root_manifests_subprefix()
-        );
-        assert_eq!(
-            DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant-one"),
-            "_operator/catalog/_shards/74656e616e742d6f6e65/"
-        );
-        assert_eq!(
-            DrPathBuilder::system_catalog_shard_manifests_subprefix_from(&canonical, "tenant-one"),
-            DrPathBuilder::system_catalog_shard_manifests_subprefix("tenant-one")
         );
         // Trailing slashes and single-segment prefixes degrade, never panic.
         assert_eq!(
