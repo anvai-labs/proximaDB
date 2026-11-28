@@ -9,9 +9,9 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Fix steps 1 and 2 are done. Direction was given 2026-11-28 (meter every provider-billed operation, risk conservative); see <<decision>>. Six questions there are still open and change the shape of the build. Filed 2026-11-25 by the ADR-098 scope reconciliation, Completion ledger G9. It started as follow-up **F-tenant** in link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (review L3, 2026-11-21). Scope widened 2026-11-25 (review of #2576) from the directory publish to every directory and segment publish I/O on flush and compaction. Scope widened again 2026-11-28 to every provider-facing method on both storage stacks. TD-PAXMETA-1 points here (pointer added by #2575).
-| Priority | **P1.** This is a mandate gap, not polish. Co-design mandates #3 and #5 require every I/O boundary to carry `TenantContext` and every dimension to be metered per tenant. Since the flush-time publish was flipped default ON (2026-11-20), every PAX flush does this I/O.
-| Component | Flush segment write: the staged write in `src/storage/engines/sst/flush/mod.rs` (`self.filesystem().get_filesystem(&staging_url)` and `get_filesystem(&final_url)`). Compaction output write: `get_filesystem(&output_path)` in `src/storage/engines/sst/compaction.rs`. Flush directory publish: `refresh_directory_after_flush` in `src/storage/engines/sst/flush/mod.rs` (`self.filesystem().get_filesystem(dir_url)`). Compaction publish: `refresh_centroid_directory` in `src/storage/engines/sst/compaction.rs` (`self.filesystem_factory.get_filesystem(&dir_url)`). The same file's `shared_collection_model` loads the newest directory the same untenanted way. Publisher: `publish_centroid_directory` / `publish_centroid_directory_bounded` in `src/storage/engines/sst/centroid_directory_publisher.rs`.
+| Status | **Open. Priority raised: it now carries a billing defect.** Fix steps 1 and 2 are done (2026-11-28) and were corrected the same day after review. <<atrest>> records that the per-tenant at-rest figure does not move for data written through the server, so GB-month is not billed for it. That is fix step 3 and comes first. Direction was given 2026-11-28 (meter every provider-billed operation, risk conservative); see <<decision>>. Six questions there are still open and change the shape of steps 4 to 6. Filed 2026-11-25 by the ADR-098 scope reconciliation, Completion ledger G9. It started as follow-up **F-tenant** in link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (review L3, 2026-11-21). Scope widened 2026-11-25 (review of #2576) from the directory publish to every directory and segment publish I/O on flush and compaction. Scope widened again 2026-11-28 to every provider-facing write and delete on both storage stacks, plus the at-rest counter. TD-PAXMETA-1 points here (pointer added by #2575).
+| Priority | **P1.** This is a mandate gap, not polish, and it now carries a billing defect: see <<atrest>>. Co-design mandates #3 and #5 require every I/O boundary to carry `TenantContext` and every dimension to be metered per tenant. Since the flush-time publish was flipped default ON (2026-11-20), every PAX flush does this I/O.
+| Component | The full list is the <<census>> table. The sites that issue billable provider requests: the segment PUT, resolved in `crates/storage/proximadb-sst-engine/src/staged_write.rs` and used by both flush and compaction; the DELETE of superseded compaction inputs, `retire_compaction_input` in `src/storage/engines/sst/compaction.rs`; the flush directory publish, `refresh_directory_after_flush` in `src/storage/engines/sst/flush/mod.rs`; the compaction directory publish, `refresh_centroid_directory` in `compaction.rs`; and the directory load in `shared_collection_model`. Publisher: `publish_centroid_directory` and `publish_centroid_directory_bounded` in `src/storage/engines/sst/centroid_directory_publisher.rs`, which takes its filesystem from its caller. At-rest defect: `stats.data_size_bytes`, written only by `CollectionManager::update_stats` in `src/services/collection/manager.rs`, and read by `aggregate_tenant_storage` in `src/metrics/consumption_metrics.rs`.
 | Authority | CLAUDE.md co-design mandates #3 and #5; link:../../12-design/adr/ADR-098-metadata-spine.adoc[ADR-098] D2.2 (publish at flush and compaction) and Completion ledger G9.
 | Relates to | link:TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (F-tenant, F-ingest), TD-TIER-1 (directory residency for granted collections)
 |===
@@ -26,8 +26,8 @@ first look, for the compaction output write (`get_filesystem(&output_path)` in `
 So the directory publish is one known gap, not the only one. No `TenantContext` reaches it. Each flush does roughly 3 GETs (2
 ranged plus the directory), 1 LIST, 1 PUT and, from the third flush on, 1 DELETE (TD-PAXMETA-1
 Status). None of the directory requests is metered or billed per tenant. Whether the segment-write
-bytes are metered some other way (for example by a decorator below `get_filesystem`) is not yet
-verified; that is the census step below.
+bytes are metered some other way was settled by the census: they are not. The segment PUT is
+issued from `staged_write.rs`, outside any query trace, and nothing records it per request.
 
 Isolation is not affected. The directory path is derived by `DrPathBuilder` under the
 collection's tenant prefix, so isolation stays structural. The gap is metering and billing only.
@@ -35,32 +35,54 @@ collection's tenant prefix, so isolation stays structural. The gap is metering a
 [[census]]
 == Census (fix step 1)
 
-Done 2026-11-28 against develop @ `be45e7122`. Every filesystem resolution on the PAX flush
-and compaction paths is listed, with what reaches it.
+Done 2026-11-28 against develop @ `8a0d2ca27`. A first version of this census listed the 10
+`get_filesystem` calls in `flush/mod.rs` and `compaction.rs` and stopped there. That was
+incomplete in two ways. The PUT that publishes a segment is resolved in a third file,
+`crates/storage/proximadb-sst-engine/src/staged_write.rs`, and compaction deletes superseded
+generations through `factory.delete(path)`, which resolves a filesystem internally. Both were
+missing. The table below covers them.
 
-[cols="1,3,1,1", options="header"]
+"Metered per tenant" means: reaches the always-on per-tenant billing meters in
+`src/metrics/consumption_metrics.rs`.
+
+[cols="2,3,1,1", options="header"]
 |===
-| Site | What it does | `TenantContext` reaches it | Metered per tenant
+| Site | What it does | Tenant reaches it | Metered per tenant
+
+| `staged_write.rs` `get_filesystem(remote)` (first) and `get_filesystem(&remote)`
+| **The segment PUT.** Used by both flush and compaction to publish the output object
+| No
+| One `"flush_write"` per flush, from `flush_materializer.rs`. Not per request
+
+| `staged_write.rs` `get_filesystem(url)`
+| Warm-object spawn after publish
+| No
+| No
+
+| `compaction.rs` `retire_compaction_input`, `factory.delete(path)`
+| **DELETE of each superseded compaction input**
+| No
+| No
 
 | `flush/mod.rs` `get_filesystem(&staging_url)`
-| Segment write: metadata of the staged file
+| Metadata of the staged file
 | No
 | No
 
 | `flush/mod.rs` `get_filesystem(&final_url)`
-| Segment write: publish of the final file
+| Create-only publish, used on the recovery-materialization path only
 | No
 | No
 
 | `flush/mod.rs` `get_filesystem(&final_file_path)`
-| Segment write: warm-object spawn after publish
+| Warm-object spawn after publish
 | No
 | No
 
 | `flush/mod.rs` `get_filesystem(dir_url)` in `refresh_directory_after_flush`
-| Flush directory publish
+| **Flush directory publish**: LIST, GETs, one PUT, and a DELETE of a superseded generation
 | No
-| No
+| No. LIST and GET reach the trace only when a query is in scope, which a flush is not
 
 | `flush/mod.rs` `get_filesystem(path)` (free helper)
 | Header-prefix read of a segment
@@ -68,9 +90,9 @@ and compaction paths is listed, with what reaches it.
 | No
 
 | `compaction.rs` `get_filesystem("file://")`
-| Base filesystem for the compaction cache
+| Base filesystem for the compaction cache. Local, not a provider call
 | No
-| No
+| Not applicable
 
 | `compaction.rs` `get_filesystem(&dir_url)` (first)
 | Directory load (`shared_collection_model`)
@@ -78,12 +100,12 @@ and compaction paths is listed, with what reaches it.
 | No
 
 | `compaction.rs` `get_filesystem(&dir_url)` (second)
-| Compaction directory publish (`refresh_centroid_directory`)
+| **Compaction directory publish** (`refresh_centroid_directory`)
 | No
 | No
 
 | `compaction.rs` `get_filesystem(&output_path)`
-| Compaction output write
+| Resolves the publication backend, to decide whether direct remote publication is possible
 | No
 | No
 
@@ -93,68 +115,86 @@ and compaction paths is listed, with what reaches it.
 | No
 |===
 
-Result: 10 of 10 resolutions are untenanted. The question this census was meant to settle
-(are the segment-write bytes metered by a decorator below `get_filesystem`?) is answered: no.
+Result: no site on the flush or compaction path receives a tenant, and only one of them is
+metered at all, and that one per engine operation rather than per provider request. The
+question this census was meant to settle (are the segment-write bytes metered by a decorator
+below `get_filesystem`?) is answered: no.
 
 [[premise]]
 == Premise check (fix step 2)
 
 Fix step 2 asks for the per-tenant I/O metering seam that the tenanted SST read and write paths
-already use. It does not exist at the storage layer. A per-tenant billing module does exist one
-layer up, and the storage layer never calls it for the operations a provider bills for.
-Evidence, develop @ `be45e7122`.
+already use. One exists for *reads on the query path*. It does not exist for writes, for
+deletes, or for any I/O outside a query. Evidence, develop @ `8a0d2ca27`.
 
-The billing module exists and is always on:
+What exists and is always on:
 
 * `src/metrics/consumption_metrics.rs` is installed unconditionally at boot
-  (`install_billing_observer`, called from `src/database.rs`). It already has the meters this TD
-  needs: `record_object_store_op(tenant, operation)`, `record_storage_bytes(tenant, kind, bytes)`
-  and `record_object_store_write_bytes_by_tier(tenant, tier, bytes)`.
-* Bytes at rest are snapshotted per tenant every 300 s (`record_storage_snapshot`, from the
-  same file), and pushed to the durable metering writer every 3600 s.
-* `build_kru` (`proximadb-observability-engine/src/metering_event.rs`) bills reads from a search
-  plan trace and has one production caller. That is read-compute billing, not storage.
+  (`install_billing_observer`, called from `src/database.rs`). It has `record_object_store_op`,
+  `record_storage_bytes` and `record_object_store_write_bytes_by_tier`.
+* **Query-path reads are billed per tenant today.** At the physical boundary the `FileSystem`
+  stack records every GET, ranged GET, LIST and HEAD, with bytes, into the per-query `IoTrace`
+  (`record_physical_full_read` and its neighbours in `src/storage/persistence/filesystem/mod.rs`).
+  That trace carries the tenant, and the billing observer reads it. The second stack's reads
+  reach the same trace through `install_io_recorder`.
+* An at-rest snapshot runs per tenant: every 300 s by default into the gauge, and every 3600 s
+  by default into the durable metering writer. Both intervals are environment-overridable.
+* KSU is defined as resident bytes times time, in
+  link:../../12-design/adr/ADR-030-unified-hotpath-trace-meter-seam.adoc[ADR-030], which states
+  that KSU is *not* metered there.
 
-The storage layer does not reach those meters:
+What is missing:
 
-* **Two storage stacks, and neither is tenanted.**
-  ** The `FileSystem` stack resolves through `FileSystemFactory::get_filesystem(&self, url)` in
-     `src/storage/persistence/filesystem/mod.rs`, which takes no tenant.
-  ** The second stack, `ProximaObjectStore` over upstream `object_store`
-     (`crates/storage/proximadb-object-store/src/lib.rs`), has no factory. 18 production
-     files call `ProximaObjectStore::from_url` directly.
-* **Reads are counted, but not by tenant.**
-  ** The `FileSystem` stack counts GETs and bytes into process-global `GetCounters`
-     (`proximadb-storage-filesystem-types/src/counting.rs`).
-  ** The second stack records reads into the per-query `IoTrace` through a process-global
-     recorder (`install_io_recorder`, installed in production at `src/database.rs`).
-  ** Neither is keyed by tenant, and neither is a billing record.
-* **Writes, LISTs, HEADs and DELETEs are not counted at the provider layer.** On the second
-  stack every provider call goes through the methods of `ProximaObjectStore` (`get`,
-  `get_range`, `get_ranges`, `head`, `list`, `put_opts`, `put_if_absent`, `delete`). Only the
-  three GET methods record anything.
-* **The billing meters are called by hand from upper layers.** `record_object_store_op` has 8
+* **PUT and DELETE are not metered anywhere.** They fall outside a query, so no trace covers
+  them. This is the gap that matters for a provider that bills per request.
+* **The request meters are called by hand from upper layers.** `record_object_store_op` has 8
   production call sites, in `src/services/record_store.rs` and
   `src/storage/flush_materializer.rs`. They count engine operations, not provider requests: one
   `"flush_write"` per flush, however many PUTs, LISTs and DELETEs that flush issued.
-* `record_storage_bytes` has 0 callers outside the at-rest snapshot.
+* **`record_storage_bytes` has no caller outside the at-rest snapshot.**
   `record_object_store_write_bytes_by_tier` has 3 production callers.
-* No document under `docs/` defines a storage unit (`\bKSU\b` has no hit).
+* **The second stack has no choke point.** `ProximaObjectStore`
+  (`crates/storage/proximadb-object-store/src/lib.rs`) has no factory: 10 production files
+  construct it directly through `from_url`. It also exposes the raw upstream store, through
+  `store()` and through the free function `store_for_url`, so a provider call can bypass its
+  methods entirely.
+* **On the second stack only the GET methods record anything.** `head`, `list`, `put_opts`,
+  `put_if_absent` and `delete` do not.
+* **The process-global `GetCounters` are not a billing input.** They are wrapped in only when
+  `PROXIMADB_COUNT_FS_IO` is set, which only benchmarks set.
 
-Consequence: every provider request the engines issue below those hand-placed sites reaches the
-provider without being attributed to the tenant that caused it. Passing a `TenantContext` down
-to `get_filesystem` by itself would change nothing, because neither stack reads a tenant at that
-layer.
+Consequence: adding a request meter without care would double-bill reads, which are already
+billed, and would still miss the PUTs and DELETEs. The work is therefore narrower and more
+specific than this TD first assumed: meter PUT and DELETE (and LIST and HEAD outside a query)
+at the provider boundary, and leave the existing read path alone.
 
-Limits of the at-rest snapshot, found while checking this:
+[[atrest]]
+== Defect found: the at-rest snapshot reads a counter the server never updates
 
-* **Its size is the engine's own counter.** `aggregate_tenant_storage` sums
-  `stats.data_size_bytes` from `list_collections()`. That is not a measurement of the bucket.
-  Objects the engine does not count, such as directory objects, catalog shards, Iceberg
-  metadata and superseded generations awaiting cleanup, are stored and billed by the provider
-  but absent from the number.
-* **Its tenant is `config.owner`.** A collection with no owner is attributed to `"default"`. A
-  missing owner moves a collection's storage to an account nobody is billed for.
+This is a billing defect, not a documentation gap. It is recorded here because it was found
+during this check and it directly understates GB-month.
+
+* `aggregate_tenant_storage` sums `stats.data_size_bytes` over `list_collections()`.
+* That field is created as `0` (`src/services/collection/manager.rs`, collection creation).
+* Its only writer is `CollectionManager::update_stats`, and the only production caller of that
+  method is the embedded binding (`crates/binding/proximadb-embedded/src/lib.rs`). The server
+  does not call it.
+* The server's write path calls a different `update_stats`, on the write-buffer manager
+  (`src/storage/metadata/atomic.rs`, `store.rs`, `write_ahead_log.rs`). That updates the write
+  buffer's own in-memory statistics, not the catalog record the snapshot reads.
+
+Result: for data written through the server, the per-tenant at-rest figure stays at whatever it
+was at creation. The hourly durable snapshot records `0` for it. GB-month is therefore not
+billed for server-ingested data.
+
+Two further limits of the same snapshot:
+
+* **Its tenant is `config.owner`.** A collection whose config is absent, or whose owner is
+  absent or empty, is attributed to `"default"`. A missing owner moves a collection's storage
+  to an account nobody is billed for.
+* **Even where the counter is updated, it is the engine's own number**, not a measurement of
+  the bucket. Objects the engine does not count, such as the directory objects written by
+  `centroid_directory_publisher.rs`, are stored and billed by the provider but absent from it.
 
 [[decision]]
 == Direction (2026-11-28) and open questions
@@ -174,17 +214,19 @@ Deployment assumptions stated with it:
 * No margin is taken on growth tiers. Margin comes from disk and memory caches in front of the
   cold tiers.
 
-What follows for this TD:
+What follows, given what <<premise>> found:
 
-. *What is metered.* Every provider request by kind (GET, ranged GET, LIST, HEAD, PUT including
-  conditional PUT, DELETE, COPY where the backend issues one), with bytes for every GET and PUT.
-  The ledger keeps raw requests and raw bytes, which is what each provider's price list is
-  written in.
-. *Bytes at rest* stay a periodic snapshot. They are out of scope for the per-request meter and
-  are reconciled separately.
-. *When no tenant resolves.* The request is recorded against an explicit operator account. It
-  is never dropped, and it never fails the I/O: a segment write cannot be skipped. This makes
-  unattributed cost visible instead of silently absorbed.
+. *Reads on the query path are already billed per tenant.* They must not be metered a second
+  time. Any new meter has to exclude them, or the read bill doubles.
+. *PUT and DELETE are the unmetered billable operations.* They are what this TD meters first.
+  LIST and HEAD outside a query are metered the same way.
+. *The ledger keeps raw requests by kind and raw bytes.* That is what each provider's price list
+  is written in, so a price can be applied per provider later without re-measuring.
+. *Bytes at rest need the counter fixed before they can be billed.* See <<atrest>>.
+. *When no tenant resolves*, the request is recorded against an explicit operator account. It
+  is never dropped from the ledger, and it never fails the I/O: a segment write cannot be
+  skipped. Unattributed cost becomes a visible line rather than an absorbed one. This is the
+  proposed rule and is listed below as still to be confirmed.
 
 Open questions, put to the owner on 2026-11-28 and not yet answered. They change the shape of
 the build and are recorded here so the answers land next to the work:
@@ -192,9 +234,10 @@ the build and are recorded here so the answers land next to the work:
 . *WAL placement.* Is the WAL on EBS or on S3 by default, and is it per tenant? A WAL on S3
   issues a PUT per commit, which makes it the most request-expensive path a write-heavy tenant
   can drive. On EBS it costs nothing per request.
-. *At-rest accuracy.* Is the engine's size counter acceptable as the billable number, or must
-  bytes at rest be measured from the bucket? Measuring costs LIST and HEAD requests. A hybrid
-  is to measure daily and reconcile against the counter.
+. *At-rest source.* Now that the server's size counter is known not to move (<<atrest>>), should
+  bytes at rest be measured from the bucket, or should the counter be fixed and kept as the
+  source? Measuring from the bucket costs LIST and HEAD requests. A hybrid is to measure daily
+  and reconcile against the counter.
 . *Storage classes.* Can tenant data move to Infrequent Access or Archive? A restore from
   Archive bills a per-GB retrieval fee and a per-request fee, far above a normal GET, and would
   need its own meter.
@@ -206,51 +249,52 @@ the build and are recorded here so the answers land next to the work:
   over failing the request.
 
 The open design question is how the tenant reaches the provider-facing methods on the second
-stack, which has no factory and 18 construction sites. That belongs in a metering design
-record, not in this TD.
+stack. That stack has no factory, 10 production files construct it directly, and it exposes the
+raw upstream store, so a meter on its methods alone can be bypassed. That belongs in a metering
+design record, not in this TD.
 
 == Fix
 
-. **Census.** DONE 2026-11-28, see <<census>>. List every filesystem resolution on the PAX flush and compaction paths (segment
-  staging and final writes, compaction output, directory publish and directory load, deletes of
-  superseded generations). For each one, record whether a `TenantContext` reaches it and whether
-  its requests and bytes are metered per tenant. Commit the list here.
-. **Verify the premise.** DONE 2026-11-28, see <<premise>>. No per-tenant metering seam exists at
-  the storage layer. A per-tenant billing module exists one layer up, and the storage layer
-  never calls it for provider-billed operations. Identify the per-tenant I/O metering seam that the tenanted SST
-  read and write paths already use, and count its callers. If that seam does not exist at this
-  layer, say so here before building one.
-. **Meter provider requests.** Record every provider request by kind, with its bytes for GET and
-  PUT, against the tenant that caused it. Do this at the provider-facing methods of both storage
-  stacks, so no call site can forget it. Feed `record_object_store_op` and the byte meters in
-  `src/metrics/consumption_metrics.rs`; do not build a second ledger. Scope is wider than this
-  TD's original flush and compaction paths: every provider-facing method on both stacks. Tracked
-  in the metering design record.
-. **Plumb the tenant.** Carry the tenant to the provider-facing methods. For this TD's paths
-  that means `refresh_directory_after_flush`, `refresh_centroid_directory`,
-  `shared_collection_model` and the segment write. A request whose tenant cannot be resolved is
-  recorded against the explicit operator account from <<decision>>.
-. Fail closed per the boundary contract. A directory publish that cannot resolve its tenant does
-  not run untenanted; it is skipped with a warning. The directory is a projection, so the flush
-  still succeeds and readers keep the footer path. A segment write is not optional, so it is
-  attributed to the operator account, as <<decision>> now specifies. It is never dropped from the
-  ledger and it never silently goes unmetered.
-. **Reconcile bytes at rest.** Compare the at-rest snapshot (the engine's `data_size_bytes`,
-  attributed by `config.owner`) with the bucket, on a cadence set by the answer to the at-rest
-  question in <<decision>>, and alert when they diverge.
+. **Census.** DONE 2026-11-28, see <<census>>. It was corrected the same day after review: the
+  first version missed the file that issues the segment PUT and the path that deletes superseded
+  generations.
+. **Verify the premise.** DONE 2026-11-28, see <<premise>>. Reads on the query path are billed
+  per tenant. PUT and DELETE are not metered anywhere.
+. **Fix the at-rest counter.** See <<atrest>>. Give the server a writer for
+  `stats.data_size_bytes`, so the per-tenant snapshot reflects server-ingested data. Then decide
+  the at-rest source (question 2 above) and add a reconciliation against the bucket. This comes
+  before any per-request meter, because GB-month is billed now and is wrong now.
+. **Meter writes and deletes.** Record every PUT, conditional PUT and DELETE, with bytes for
+  PUT, against the tenant that caused it, at the provider-facing boundary of both storage stacks.
+  LIST and HEAD issued outside a query are metered the same way. Feed the existing meters in
+  `src/metrics/consumption_metrics.rs`. Do not build a second ledger.
+. **Do not double-bill reads.** Show, in a test, that a query-path read is billed once and only
+  once after the write meter lands.
+. **Close the bypass.** The second stack exposes the raw upstream store through `store()` and
+  `store_for_url`. Either route those through the metered surface or record the gap explicitly.
+. **Plumb the tenant.** Carry the tenant to the provider-facing boundary. For this TD's paths
+  that means `staged_write.rs` (the segment PUT), `retire_compaction_input` (the DELETEs),
+  `refresh_directory_after_flush`, `refresh_centroid_directory` and `shared_collection_model`.
+  A directory publish that cannot resolve its tenant is skipped with a warning and is not run
+  untenanted: the directory is a projection, so the flush still succeeds and readers keep the
+  footer path. A request whose tenant cannot be resolved is recorded against the operator
+  account, once that rule is confirmed.
 
 == Acceptance
 
 * The census is committed in this TD.
-* A counting test runs a flush and a compaction on a tenanted collection. It shows every
-  request of the segment writes and the directory publish (GET, LIST, HEAD, PUT, DELETE)
-  recorded against that tenant in the billing meters, with its bytes where the request carries
-  any.
+* A counting test runs a flush and a compaction on a tenanted collection. It shows every PUT and
+  DELETE of the segment write, the directory publish and the superseded-generation cleanup
+  recorded against that tenant in the billing meters, with bytes for each PUT.
 * Negative control: removing the tenant plumbing turns the test red, because the requests land
   on the operator account instead of the tenant.
 * No request is ever dropped from the ledger: a test with no resolvable tenant shows every
   request recorded against the operator account.
-* The at-rest snapshot for a tenant equals the sum of that tenant's collections' sizes, and a
-  collection with no owner is visible on the operator account rather than on `"default"`.
+* A query-path read is billed exactly once. A test asserts the read count in the billing meters
+  is unchanged by the write meter.
+* The at-rest snapshot for a tenant grows after the server writes data to that tenant's
+  collection. A test creates a collection, inserts through the server path, and asserts the
+  snapshot is non-zero.
+* A collection with no owner is visible on the operator account rather than on `"default"`.
 * The existing directory tests (TD-PAXMETA-1 evidence) and the Azurite request-count harness
   (`sift-object-store-request-counts`) are unchanged.
